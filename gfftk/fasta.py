@@ -316,7 +316,7 @@ def fasta2dict(fasta, full_header=False):
 
     """
     seqs = OrderedDict()
-    if isinstance(fasta, io.BytesIO):
+    if isinstance(fasta, (io.BytesIO, io.StringIO)):
         fasta.seek(0)
         infile = fasta
     else:
@@ -327,7 +327,7 @@ def fasta2dict(fasta, full_header=False):
         else:
             title = title.split()[0]
         seqs[title] = seq
-    if not isinstance(fasta, io.BytesIO):
+    if not isinstance(fasta, (io.BytesIO, io.StringIO)):
         infile.close()
     return seqs
 
@@ -352,7 +352,7 @@ def fasta2headers(fasta, full_header=False):
     """
     # generate a set of the contig/scaffold names
     headers = set()
-    if isinstance(fasta, io.BytesIO):
+    if isinstance(fasta, (io.BytesIO, io.StringIO)):
         fasta.seek(0)
         infile = fasta
     else:
@@ -363,7 +363,7 @@ def fasta2headers(fasta, full_header=False):
         else:
             title = title.split()[0]
         headers.add(title)
-    if not isinstance(fasta, io.BytesIO):
+    if not isinstance(fasta, (io.BytesIO, io.StringIO)):
         infile.close()
     return headers
 

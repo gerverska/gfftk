@@ -977,6 +977,15 @@ def table2asn(
     cleanup=True,
 ):
     # function to run table2asn for whole genome
+    # Check if table2asn is functional before proceeding
+    from .utils import test_table2asn_functional
+
+    if not test_table2asn_functional():
+        raise RuntimeError(
+            "table2asn binary found but is not functional. "
+            "This may be due to OS compatibility issues or a corrupted installation. "
+            "Please reinstall table2asn or check system requirements."
+        )
     workdir = os.path.join(tmpdir, f"table2asn_{uuid.uuid4()}")
     if not os.path.isdir(workdir):
         os.makedirs(workdir)

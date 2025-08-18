@@ -219,14 +219,18 @@ def consensus_subparser(subparsers):
 def convert_subparser(subparsers):
     group = subparsers.add_parser(
         "convert",
-        description="convert GFF3/tbl format into another format [output gff3, gtf, tbl, gbff, fasta]. ",
-        help="convert GFF3/tbl format into another format [output gff3, gtf, tbl, gbff, fasta].",
+        description="convert GFF3/tbl format into another format [output gff3, gtf, tbl, gbff, fasta, combined]. ",
+        help="convert GFF3/tbl format into another format [output gff3, gtf, tbl, gbff, fasta, combined].",
         formatter_class=MyHelpFormatter,
         add_help=False,
     )
 
     required_args = group.add_argument_group("Required arguments")
-    required_args.add_argument("-f", "--fasta", required=True, help="genome in FASTA format")
+    required_args.add_argument(
+        "-f",
+        "--fasta",
+        help="genome in FASTA format (optional for combined GFF3+FASTA files)",
+    )
     required_args.add_argument(
         "-i",
         "--input",
@@ -251,7 +255,7 @@ def convert_subparser(subparsers):
     optional_args.add_argument(
         "--output-format",
         dest="output_format",
-        help="format of output file [gff3, gtf, tbl, gbff, proteins, transcripts, cds-transcripts]. (default: auto)",
+        help="format of output file [gff3, gtf, tbl, gbff, proteins, transcripts, cds-transcripts, combined]. (default: auto)",
         choices=[
             "gff3",
             "gtf",
@@ -260,6 +264,7 @@ def convert_subparser(subparsers):
             "transcripts",
             "cds-transcripts",
             "gbff",
+            "combined",
         ],
         metavar="",
     )
@@ -298,6 +303,11 @@ def convert_subparser(subparsers):
     )
     optional_args.add_argument(
         "--debug", action="store_true", help="write parsing errors to stderr"
+    )
+    optional_args.add_argument(
+        "--url-encode",
+        action="store_true",
+        help="URL encode attribute values in GFF3 output for downstream tool compatibility",
     )
 
     other_args = group.add_argument_group("Other arguments")
@@ -364,10 +374,17 @@ def sanitize_subparser(subparsers):
 
     required_args = group.add_argument_group("Required arguments")
     required_args.add_argument(
-        "-f", "--fasta", required=True, help="genome in FASTA format", metavar=""
+        "-f",
+        "--fasta",
+        help="genome in FASTA format (optional for combined GFF3+FASTA files)",
+        metavar="",
     )
     required_args.add_argument(
-        "-g", "--gff3", required=True, help="annotation in GFF3 format", metavar=""
+        "-g",
+        "--gff3",
+        required=True,
+        help="annotation in GFF3 format (or combined GFF3+FASTA)",
+        metavar="",
     )
 
     optional_args = group.add_argument_group("Optional arguments")
@@ -378,6 +395,11 @@ def sanitize_subparser(subparsers):
         metavar="",
     )
     optional_args.add_argument("--debug", action="store_true", help="write/keep intermediate files")
+    optional_args.add_argument(
+        "--url-encode",
+        action="store_true",
+        help="URL encode attribute values in GFF3 output for downstream tool compatibility",
+    )
 
     other_args = group.add_argument_group("Other arguments")
     other_args.add_argument(

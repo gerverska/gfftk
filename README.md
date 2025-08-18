@@ -11,9 +11,11 @@ GFFtk is a comprehensive toolkit for working with genome annotation files in GFF
 ## Features
 
 - **Format Conversion**: Convert between GFF3, GTF, TBL, and GenBank formats
+- **Combined GFF3+FASTA**: Support for combined files containing both annotations and sequences
 - **Sequence Extraction**: Extract protein and transcript sequences from annotations
 - **Advanced Filtering**: Filter annotations using flexible regex patterns
 - **Consensus Models**: Generate consensus gene models from multiple sources
+- **Non-Standard Features**: Support for intron, noncoding_exon, five_prime_UTR_intron, and pseudogenic_exon features
 - **File Manipulation**: Sort, sanitize, and rename features in annotation files
 
 ## Installation
@@ -37,6 +39,15 @@ gfftk convert -i input.gff3 -f genome.fasta -o output.gtf
 
 # Extract protein sequences
 gfftk convert -i input.gff3 -f genome.fasta -o proteins.faa --output-format proteins
+```
+
+### Combined GFF3+FASTA Format
+```bash
+# Create a combined file from separate GFF3 and FASTA files
+gfftk convert -i input.gff3 -f genome.fasta -o combined.gff --output-format combined
+
+# Read a combined file (no separate FASTA file needed)
+gfftk convert -i combined.gff -o output.gff3 --output-format gff3
 ```
 
 ### Advanced Filtering

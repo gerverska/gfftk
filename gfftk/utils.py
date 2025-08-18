@@ -91,6 +91,40 @@ def which2(program):
     return None
 
 
+def test_table2asn_functional():
+    """Test if table2asn binary is functional by running it with -help flag.
+
+    Returns
+    -------
+    bool
+        True if table2asn runs successfully, False otherwise
+    """
+    import os
+    import subprocess
+
+    try:
+        # Run table2asn with -help flag and capture output
+        # Use DEVNULL to suppress output and set a timeout to prevent hanging
+        with open(os.devnull, "w") as devnull:
+            result = subprocess.run(
+                ["table2asn", "-help"],
+                stdout=devnull,
+                stderr=devnull,
+                timeout=10,  # 10 second timeout
+                check=False,  # Don't raise exception on non-zero exit
+            )
+        # table2asn -help typically returns 0 or 1, both indicate it's working
+        # If it returns something like 127 (command not found), it's not working
+        return result.returncode in [0, 1]
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+        OSError,
+    ):
+        return False
+
+
 def open_pipe(command, mode="r", buff=1024 * 1024):
     import signal
     import subprocess

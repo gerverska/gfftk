@@ -7,12 +7,89 @@ import sys
 import types
 import uuid
 from collections import OrderedDict
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from natsort import natsorted
 
 from .fasta import RevComp, codon_table, fasta2dict, fasta2headers, getSeqRegions, translate
 from .utils import zopen
+
+
+def is_combined_gff_fasta(filename):
+    """Check if a file contains both GFF3 and FASTA data.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the file to check
+
+    Returns
+    -------
+    bool
+        True if file contains ##FASTA directive, False otherwise
+    """
+    if isinstance(filename, io.BytesIO):
+        filename.seek(0)
+        infile = filename
+    else:
+        infile = zopen(filename)
+
+    try:
+        for line in infile:
+            if line.startswith("##FASTA"):
+                return True
+            # Stop checking after we see the first FASTA header or too many lines
+            if line.startswith(">") or line.count("\n") > 10000:
+                break
+    finally:
+        if not isinstance(filename, (io.BytesIO, io.StringIO)):
+            infile.close()
+
+    return False
+
+
+def split_combined_gff_fasta(filename):
+    """Split a combined GFF3+FASTA file into separate GFF3 and FASTA components.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the combined file
+
+    Returns
+    -------
+    tuple
+        (gff_content, fasta_content) as file-like objects
+    """
+    gff_lines = []
+    fasta_lines = []
+    in_fasta_section = False
+
+    if isinstance(filename, io.BytesIO):
+        filename.seek(0)
+        infile = filename
+    else:
+        infile = zopen(filename)
+
+    try:
+        for line in infile:
+            if line.startswith("##FASTA"):
+                in_fasta_section = True
+                continue
+
+            if in_fasta_section:
+                fasta_lines.append(line)
+            else:
+                gff_lines.append(line)
+    finally:
+        if not isinstance(filename, (io.BytesIO, io.StringIO)):
+            infile.close()
+
+    # Create file-like objects from the content
+    gff_content = io.StringIO("".join(gff_lines))
+    fasta_content = io.StringIO("".join(fasta_lines))
+
+    return gff_content, fasta_content
 
 
 def start_end_gap(seq, coords):
@@ -29,6 +106,447 @@ def start_end_gap(seq, coords):
     return seq, coords
 
 
+def _process_introns_to_exons(Genes, introns_by_parent, idParent, mrna_coordinates=None):
+    """Process intron features to generate exon coordinates.
+
+    For each mRNA that has introns, calculate exon coordinates by:
+    1. Finding the mRNA boundaries (start, end)
+    2. Sorting introns by position
+    3. Generating exon coordinates from non-intronic regions
+
+    Parameters
+    ----------
+    Genes : dict
+        The genes dictionary being built
+    introns_by_parent : dict
+        Dictionary mapping parent IDs to list of intron coordinates
+    idParent : dict
+        Dictionary mapping feature IDs to their parent gene IDs
+    mrna_coordinates : dict, optional
+        Dictionary mapping transcript IDs to their mRNA feature coordinates
+    """
+    if mrna_coordinates is None:
+        mrna_coordinates = {}
+    for parent_id, intron_coords in introns_by_parent.items():
+        # Find the gene that contains this mRNA
+        gene_id = idParent.get(parent_id)
+        if not gene_id or gene_id not in Genes:
+            continue
+
+        # Find the transcript index for this parent_id
+        try:
+            transcript_idx = Genes[gene_id]["ids"].index(parent_id)
+            # Safety check for reasonable transcript index bounds
+            if transcript_idx < 0 or transcript_idx > 100:  # Reasonable upper bound
+                continue
+        except (ValueError, KeyError):
+            continue
+
+        # Get the mRNA boundaries - we need to find the mRNA feature coordinates
+        # For now, we'll calculate from the intron coordinates
+        if not intron_coords:
+            continue
+
+        # Sort introns by start position
+        intron_coords.sort(key=lambda x: x[0])
+
+        # We need to find the actual mRNA boundaries
+        # Priority order: mRNA features > existing exon coordinates > gene boundaries
+        transcript_start = None
+        transcript_end = None
+
+        # First check if we have mRNA coordinates from mRNA features
+        if parent_id in mrna_coordinates:
+            # Use mRNA feature boundaries (highest priority)
+            transcript_start, transcript_end = mrna_coordinates[parent_id]
+        elif (
+            transcript_idx < len(Genes[gene_id]["mRNA"]) and Genes[gene_id]["mRNA"][transcript_idx]
+        ):
+            # Use existing mRNA exon boundaries
+            mrna_coords = Genes[gene_id]["mRNA"][transcript_idx]
+            transcript_start = min(coord[0] for coord in mrna_coords)
+            transcript_end = max(coord[1] for coord in mrna_coords)
+        else:
+            # Fallback to gene location as mRNA boundaries
+            transcript_start, transcript_end = Genes[gene_id]["location"]
+
+        # Safety check - ensure we have valid boundaries
+        if transcript_start is None or transcript_end is None:
+            continue
+
+        # Generate exon coordinates by excluding intron regions
+        exon_coords = []
+        current_pos = transcript_start
+
+        for intron_start, intron_end in intron_coords:
+            # Add exon before this intron (if there's space)
+            if current_pos < intron_start:
+                exon_coords.append((current_pos, intron_start - 1))
+            # Move past this intron
+            current_pos = intron_end + 1
+
+        # Add final exon after last intron (if there's space)
+        if current_pos <= transcript_end:
+            exon_coords.append((current_pos, transcript_end))
+
+        # Store the calculated exon coordinates in the mRNA field
+        # Ensure mRNA list exists and is properly sized
+        if "mRNA" not in Genes[gene_id]:
+            Genes[gene_id]["mRNA"] = []
+
+        # Safely extend the mRNA list to accommodate this transcript index
+        # Use direct extension instead of while loop to avoid infinite loops
+        if transcript_idx >= 0 and transcript_idx < 100:  # Reasonable bounds check
+            # Extend list directly to required size
+            required_size = transcript_idx + 1
+            current_size = len(Genes[gene_id]["mRNA"])
+            if current_size < required_size:
+                # Extend with empty lists
+                Genes[gene_id]["mRNA"].extend([[] for _ in range(required_size - current_size)])
+
+            # Set the mRNA coordinates with calculated exons
+            Genes[gene_id]["mRNA"][transcript_idx] = exon_coords
+
+
+def _handle_mrna_without_exons(Genes, mrna_coordinates):
+    """Handle SGD-style mRNA features without explicit exon features.
+
+    For genes where mRNA coordinates are empty (no exon features were found),
+    but we have mRNA transcript information, use the stored mRNA feature boundaries
+    as single-exon coordinates.
+
+    This addresses SGD format where mRNA features exist but no explicit exon features.
+
+    Parameters
+    ----------
+    Genes : dict
+        The genes dictionary to process
+    mrna_coordinates : dict
+        Dictionary mapping transcript IDs to their mRNA feature coordinates
+    """
+    for gene_id, gene_data in Genes.items():
+        # Check each transcript in this gene
+        for i, transcript_coords in enumerate(gene_data.get("mRNA", [])):
+            # If mRNA coordinates are empty but we have transcript IDs
+            if not transcript_coords and i < len(gene_data.get("ids", [])):
+                transcript_id = gene_data["ids"][i]
+
+                # Use stored mRNA feature coordinates if available
+                if transcript_id in mrna_coordinates:
+                    mrna_start, mrna_end = mrna_coordinates[transcript_id]
+                    gene_data["mRNA"][i] = [(mrna_start, mrna_end)]
+                else:
+                    # Fallback to gene location
+                    gene_start, gene_end = gene_data.get("location", (0, 0))
+                    if gene_start and gene_end:
+                        gene_data["mRNA"][i] = [(gene_start, gene_end)]
+
+
+def _subtract_introns_from_region(region, introns):
+    """Subtract intron coordinates from a genomic region to get exonic parts.
+
+    Parameters
+    ----------
+    region : tuple
+        (start, end) coordinates of the region
+    introns : list
+        List of (start, end) intron coordinates
+
+    Returns
+    -------
+    list
+        List of (start, end) coordinates for exonic parts
+    """
+    if not introns:
+        return [region]
+
+    region_start, region_end = region
+    exonic_parts = []
+
+    # Sort introns by start position
+    sorted_introns = sorted(introns, key=lambda x: x[0])
+
+    current_pos = region_start
+
+    for intron_start, intron_end in sorted_introns:
+        # Skip introns that don't overlap with our region
+        if intron_end < region_start or intron_start > region_end:
+            continue
+
+        # Adjust intron boundaries to region boundaries
+        intron_start = max(intron_start, region_start)
+        intron_end = min(intron_end, region_end)
+
+        # Add exonic part before this intron
+        if current_pos < intron_start:
+            exonic_parts.append((current_pos, intron_start - 1))
+
+        # Move past this intron
+        current_pos = intron_end + 1
+
+    # Add final exonic part after last intron
+    if current_pos <= region_end:
+        exonic_parts.append((current_pos, region_end))
+
+    return exonic_parts
+
+
+def _calculate_utrs_for_transcript(gene_data, transcript_idx, utr_introns=None):
+    """Calculate and add UTR coordinates for a transcript.
+
+    For SGD genes, UTRs are not explicitly annotated but can be calculated
+    from the difference between mRNA and CDS coordinates. Accounts for introns
+    within UTR regions.
+
+    Parameters
+    ----------
+    gene_data : dict
+        The gene data structure
+    transcript_idx : int
+        Index of the transcript to process
+    utr_introns : dict, optional
+        Dictionary with '5utr' and '3utr' keys containing intron coordinates
+    """
+    if utr_introns is None:
+        utr_introns = {"5utr": [], "3utr": []}
+
+    try:
+        # Safety checks
+        if (
+            not gene_data
+            or transcript_idx < 0
+            or transcript_idx >= len(gene_data.get("mRNA", []))
+            or transcript_idx >= len(gene_data.get("CDS", []))
+        ):
+            return
+
+        mrna_coords = gene_data["mRNA"][transcript_idx]
+        cds_coords = gene_data["CDS"][transcript_idx]
+
+        if not mrna_coords or not cds_coords:
+            return
+
+        # Handle both single-exon and multi-exon transcripts
+        if len(mrna_coords) >= 1 and len(cds_coords) >= 1:
+            # Calculate overall mRNA boundaries from all exons
+            mrna_start = min(coord[0] for coord in mrna_coords)
+            mrna_end = max(coord[1] for coord in mrna_coords)
+
+            # Find the overall CDS boundaries
+            cds_start = min(coord[0] for coord in cds_coords)
+            cds_end = max(coord[1] for coord in cds_coords)
+
+            # Calculate UTRs
+            utr5_coords = []
+            utr3_coords = []
+
+            # 5' UTR: from mRNA start to CDS start
+            if mrna_start < cds_start:
+                utr5_region = (mrna_start, cds_start - 1)
+                # Subtract any 5' UTR introns to get exonic UTR coordinates
+                utr5_coords = _subtract_introns_from_region(
+                    utr5_region, utr_introns.get("5utr", [])
+                )
+
+            # 3' UTR: from CDS end to mRNA end
+            if cds_end < mrna_end:
+                utr3_region = (cds_end + 1, mrna_end)
+                # Subtract any 3' UTR introns to get exonic UTR coordinates
+                utr3_coords = _subtract_introns_from_region(
+                    utr3_region, utr_introns.get("3utr", [])
+                )
+
+            # Ensure UTR lists exist and are properly sized
+            if "5UTR" not in gene_data:
+                gene_data["5UTR"] = []
+            if "3UTR" not in gene_data:
+                gene_data["3UTR"] = []
+
+            # Extend lists safely without while loops
+            max_needed = transcript_idx + 1
+
+            # Extend 5UTR list if needed
+            current_5utr_size = len(gene_data["5UTR"])
+            if current_5utr_size < max_needed:
+                gene_data["5UTR"].extend([[] for _ in range(max_needed - current_5utr_size)])
+
+            # Extend 3UTR list if needed
+            current_3utr_size = len(gene_data["3UTR"])
+            if current_3utr_size < max_needed:
+                gene_data["3UTR"].extend([[] for _ in range(max_needed - current_3utr_size)])
+
+            # Store UTR coordinates
+            gene_data["5UTR"][transcript_idx] = utr5_coords
+            gene_data["3UTR"][transcript_idx] = utr3_coords
+
+    except Exception:
+        # Silently fail to avoid breaking the parser
+        pass
+
+
+def _process_deferred_cds(Genes, deferred_cds, idParent):
+    """Process CDS features that were deferred due to feature order issues.
+
+    This handles SGD files where CDS features appear before their parent mRNA features.
+
+    Parameters
+    ----------
+    Genes : dict
+        The genes dictionary being built
+    deferred_cds : list
+        List of CDS feature data that was deferred
+    idParent : dict
+        Dictionary mapping feature IDs to their parent gene IDs
+    """
+    for cds_data in deferred_cds:
+        Parent = cds_data["Parent"]
+        start = cds_data["start"]
+        end = cds_data["end"]
+        phase = cds_data["phase"]
+
+        # Process CDS with multiple parents
+        if "," in Parent:
+            parents = Parent.split(",")
+        else:
+            parents = [Parent]
+
+        for p in parents:
+            if p in idParent:
+                GeneFeature = idParent.get(p)
+                if GeneFeature and GeneFeature in Genes:
+                    # Find the transcript index for this parent
+                    try:
+                        i = Genes[GeneFeature]["ids"].index(p)
+                        Genes[GeneFeature]["CDS"][i].append((start, end))
+                        # Add phase
+                        try:
+                            phase_val = int(phase)
+                        except (ValueError, TypeError):
+                            phase_val = 0
+                        Genes[GeneFeature]["phase"][i].append(phase_val)
+
+                        # UTR calculation moved to after mRNA coordinate handling
+
+                    except (ValueError, IndexError):
+                        # Transcript not found, skip this CDS
+                        continue
+
+
+def _transfer_sgd_functional_annotations(gene_data, gene_attrs):
+    """Transfer functional annotations from SGD gene features to transcript level.
+
+    SGD stores rich functional annotations (GO terms, notes, dbxrefs) at the gene level
+    but these should be propagated to transcript-level features for proper annotation.
+
+    Parameters
+    ----------
+    gene_data : dict
+        The gene data structure to update
+    gene_attrs : dict
+        Dictionary of gene-level attributes from SGD
+    """
+    # Extract functional annotations from gene attributes
+    ontology_terms = gene_attrs.get("Ontology_term", "")
+    note = gene_attrs.get("Note", "")
+    dbxref = gene_attrs.get("dbxref", "")
+
+    # Parse ontology terms (GO terms, SO terms, etc.)
+    go_terms = []
+    if ontology_terms:
+        terms = ontology_terms.split(",")
+        for term in terms:
+            term = term.strip()
+            if term.startswith("GO:"):
+                go_terms.append(term)
+
+    # Parse database cross-references
+    db_xrefs = []
+    if dbxref:
+        # Handle multiple dbxrefs separated by commas
+        xrefs = dbxref.split(",")
+        for xref in xrefs:
+            xref = xref.strip()
+            if xref:
+                db_xrefs.append(xref)
+
+    # Parse and clean note field (URL decode)
+    notes = []
+    if note:
+        # URL decode the note field
+        import urllib.parse
+
+        decoded_note = urllib.parse.unquote(note)
+        # Replace %20 with spaces and %3B with semicolons, etc.
+        decoded_note = decoded_note.replace("%20", " ").replace("%3B", ";").replace("%2C", ",")
+        notes.append(decoded_note)
+
+    # Transfer annotations to all transcripts in this gene
+    num_transcripts = len(gene_data.get("type", []))
+    for i in range(num_transcripts):
+        # Ensure lists exist and are properly sized
+        for field in ["go_terms", "db_xref", "note"]:
+            if field not in gene_data:
+                gene_data[field] = []
+
+            # Extend list safely without while loop
+            required_size = i + 1
+            current_size = len(gene_data[field])
+            if current_size < required_size:
+                gene_data[field].extend([[] for _ in range(required_size - current_size)])
+
+        # Add GO terms
+        if go_terms:
+            gene_data["go_terms"][i].extend(go_terms)
+
+        # Add database cross-references
+        if db_xrefs:
+            gene_data["db_xref"][i].extend(db_xrefs)
+
+        # Add notes
+        if notes:
+            gene_data["note"][i].extend(notes)
+
+
+def _validate_sgd_gene_models(Genes, gene_attributes):
+    """Validate and correct SGD gene models using so_term_name attribute.
+
+    Uses the so_term_name attribute from gene features to validate and correct
+    transcript types and ensure proper CDS assignment for protein-coding genes.
+
+    Parameters
+    ----------
+    Genes : dict
+        The genes dictionary to process
+    gene_attributes : dict
+        Dictionary mapping gene IDs to their parsed attributes
+    """
+    for gene_id, gene_data in Genes.items():
+        if gene_id not in gene_attributes:
+            continue
+
+        attrs = gene_attributes[gene_id]
+        so_term = attrs.get("so_term_name", "")
+
+        # Handle protein-coding genes
+        if so_term == "protein_coding_gene":
+            # Correct transcript types from ncRNA to mRNA
+            for i, transcript_type in enumerate(gene_data.get("type", [])):
+                if transcript_type in ["ncRNA", "transcript"]:
+                    gene_data["type"][i] = "mRNA"
+
+            # Update products for mRNA transcripts
+            gene_symbol = attrs.get("gene", gene_data.get("name", gene_id))
+            for i, product in enumerate(gene_data.get("product", [])):
+                if len(gene_data.get("type", [])) > i and gene_data["type"][i] == "mRNA":
+                    if gene_symbol and gene_symbol != gene_id:
+                        gene_data["product"][i] = f"{gene_symbol} protein"
+                    else:
+                        gene_data["product"][i] = "hypothetical protein"
+
+            # Transfer functional annotations from gene to transcript level
+            _transfer_sgd_functional_annotations(gene_data, attrs)
+
+
 def _gff_default_parser(gff, fasta, Genes):
     # this is the default general parser to populate the dictionary
     # idea is to go through line by line and parse the records and add to Genes dictionary
@@ -41,8 +559,20 @@ def _gff_default_parser(gff, fasta, Genes):
         "no_id": [],
     }
     idParent = {}
+    # Collect introns to generate exon coordinates later
+    introns_by_parent = {}  # {parent_id: [(start, end), ...]}
+    # Collect UTR introns for proper UTR calculation
+    utr_introns_by_parent = (
+        {}
+    )  # {parent_id: {'5utr': [(start, end), ...], '3utr': [(start, end), ...]}}
+    # Collect mRNA feature coordinates for SGD-style parsing
+    mrna_coordinates = {}  # {transcript_id: (start, end)}
+    # Collect gene attributes for SGD validation
+    gene_attributes = {}  # {gene_id: attributes_dict}
+    # Collect CDS features for deferred processing (SGD feature order issue)
+    deferred_cds = []  # [(line_data, info), ...]
     SeqRecords = fasta2headers(fasta)
-    if isinstance(gff, io.BytesIO):
+    if isinstance(gff, (io.BytesIO, io.StringIO)):
         gff.seek(0)
         infile = gff
     else:
@@ -84,8 +614,12 @@ def _gff_default_parser(gff, fasta, Genes):
             "five_prime_utr",
             "three_prime_UTR",
             "three_prime_utr",
+            "intron",
+            "noncoding_exon",
+            "pseudogenic_exon",
         ]:
             continue
+
         if contig not in SeqRecords:
             errors["contig_name"].append(line)
             continue
@@ -192,7 +726,17 @@ def _gff_default_parser(gff, fasta, Genes):
                     errors["unparsed_attributes"].append(attr)
         # now we can do add to dictionary these parsed values
         # genbank gff files are incorrect for tRNA so check if gbkey exists and make up gene on the fly
-        if feature in ["gene", "pseudogene"]:
+        if feature in [
+            "gene",
+            "pseudogene",
+            "ncRNA_gene",
+            "rRNA_gene",
+            "snoRNA_gene",
+            "snRNA_gene",
+            "telomerase_RNA_gene",
+            "transposable_element_gene",
+            "tRNA_gene",
+        ]:
             if ID not in Genes:
                 if feature == "pseudogene":
                     pseudoFlag = True
@@ -230,6 +774,8 @@ def _gff_default_parser(gff, fasta, Genes):
                     Genes[ID]["location"] = (start, Genes[ID]["location"][1])
                 if end > Genes[ID]["location"][1]:
                     Genes[ID]["location"] = (Genes[ID]["location"][0], end)
+            # Store gene attributes for SGD validation
+            gene_attributes[ID] = info
         else:
             if not Parent:
                 errors["no_parent"].append(line)
@@ -243,6 +789,7 @@ def _gff_default_parser(gff, fasta, Genes):
                 "snRNA",
                 "snoRNA",
                 "tmRNA",
+                "telomerase_RNA",
             ]:
                 # required that we have an ID here, else it not parsable
                 if not ID:
@@ -314,8 +861,10 @@ def _gff_default_parser(gff, fasta, Genes):
                         )
                 if ID not in idParent:
                     idParent[ID] = Parent
-            # treat exon features
-            elif feature == "exon":
+                # Store mRNA feature coordinates for SGD-style parsing
+                mrna_coordinates[ID] = (start, end)
+            # treat exon features (including non-standard exon types)
+            elif feature in ["exon", "noncoding_exon", "pseudogenic_exon"]:
                 if "," in Parent:
                     parents = Parent.split(",")
                 else:
@@ -358,55 +907,23 @@ def _gff_default_parser(gff, fasta, Genes):
                             Genes[GeneFeature]["mRNA"][i].append((start, end))
             # treat codings sequence features
             elif feature == "CDS":
-                if "," in Parent:
-                    parents = Parent.split(",")
-                else:
-                    parents = [Parent]
-                for p in parents:
-                    if p in idParent:
-                        GeneFeature = idParent.get(p)
-                    if GeneFeature:
-                        if GeneFeature not in Genes:
-                            Genes[GeneFeature] = {
-                                "name": Name,
-                                "type": [],
-                                "transcript": [],
-                                "cds_transcript": [],
-                                "protein": [],
-                                "5UTR": [[]],
-                                "3UTR": [[]],
-                                "codon_start": [[]],
-                                "ids": [p],
-                                "CDS": [[(start, end)]],
-                                "mRNA": [],
-                                "strand": strand,
-                                "location": None,
-                                "contig": contig,
-                                "product": [],
-                                "source": source,
-                                "phase": [[]],
-                                "db_xref": [],
-                                "go_terms": [],
-                                "EC_number": [],
-                                "note": [],
-                                "partialStart": [False],
-                                "partialStop": [False],
-                                "pseudo": False,
-                                "gene_synonym": synonyms,
-                            }
-                        else:
-                            # determine which transcript this is get index from id
-                            i = Genes[GeneFeature]["ids"].index(p)
-                            Genes[GeneFeature]["CDS"][i].append((start, end))
-                            if DBxref:
-                                for dbx in DBxref:
-                                    if dbx not in Genes[GeneFeature]["db_xref"][i]:
-                                        Genes[GeneFeature]["db_xref"][i].append(dbx)
-                            # add phase
-                            try:
-                                Genes[GeneFeature]["phase"][i].append(int(phase))
-                            except ValueError:
-                                Genes[GeneFeature]["phase"][i].append("?")
+                # Defer CDS processing to handle SGD feature order issues
+                # where CDS features appear before their parent mRNA features
+                deferred_cds.append(
+                    {
+                        "contig": contig,
+                        "source": source,
+                        "feature": feature,
+                        "start": start,
+                        "end": end,
+                        "strand": strand,
+                        "phase": phase,
+                        "Parent": Parent,
+                        "Name": Name,
+                        "info": info,
+                    }
+                )
+                continue
             # treat 5' UTRs
             elif feature == "five_prime_UTR" or feature == "five_prime_utr":
                 if "," in Parent:
@@ -491,7 +1008,55 @@ def _gff_default_parser(gff, fasta, Genes):
                             # determine which transcript this is get index from id
                             i = Genes[GeneFeature]["ids"].index(p)
                             Genes[GeneFeature]["3UTR"][i].append((start, end))
-    if not isinstance(gff, io.BytesIO):
+            # handle intron features - collect them for later processing
+            elif feature == "intron":
+                if Parent:
+                    # Handle multiple parents (comma-separated)
+                    parents = Parent.split(",") if "," in Parent else [Parent]
+                    for p in parents:
+                        p = p.strip()
+                        if p not in introns_by_parent:
+                            introns_by_parent[p] = []
+                        introns_by_parent[p].append((start, end))
+            # handle UTR intron features - collect them for UTR calculation
+            elif feature in ["five_prime_UTR_intron", "three_prime_UTR_intron"]:
+                if Parent:
+                    # Handle multiple parents (comma-separated)
+                    parents = Parent.split(",") if "," in Parent else [Parent]
+                    for p in parents:
+                        p = p.strip()
+                        if p not in utr_introns_by_parent:
+                            utr_introns_by_parent[p] = {"5utr": [], "3utr": []}
+
+                        if feature == "five_prime_UTR_intron":
+                            utr_introns_by_parent[p]["5utr"].append((start, end))
+                        elif feature == "three_prime_UTR_intron":
+                            utr_introns_by_parent[p]["3utr"].append((start, end))
+
+    # Process introns to generate exon coordinates
+    _process_introns_to_exons(Genes, introns_by_parent, idParent, mrna_coordinates)
+
+    # Process deferred CDS features (SGD feature order issue)
+    _process_deferred_cds(Genes, deferred_cds, idParent)
+
+    # Post-processing: Handle SGD-style mRNA features without explicit exons
+    # If mRNA coordinates are empty but we have mRNA features, use mRNA boundaries as exon coordinates
+    _handle_mrna_without_exons(Genes, mrna_coordinates)
+
+    # Calculate UTRs for SGD genes (after mRNA coordinates are populated)
+    for gene_id, gene_data in Genes.items():
+        for i in range(len(gene_data.get("mRNA", []))):
+            # Get transcript ID for this index
+            transcript_id = (
+                gene_data.get("ids", [None])[i] if i < len(gene_data.get("ids", [])) else None
+            )
+            utr_introns = utr_introns_by_parent.get(transcript_id, {})
+            _calculate_utrs_for_transcript(gene_data, i, utr_introns)
+
+    # SGD-specific validation and correction using so_term_name
+    _validate_sgd_gene_models(Genes, gene_attributes)
+
+    if not isinstance(gff, (io.BytesIO, io.StringIO)):
         infile.close()
     return Genes, errors
 
@@ -649,7 +1214,7 @@ def _gff_miniprot_parser(gff, fasta, Genes):
                     nFT = (start, ft[1])
                     Genes[Parent]["CDS"][i][0] = nFT
                     Genes[Parent]["mRNA"][i][0] = nFT
-    if not isinstance(gff, io.BytesIO):
+    if not isinstance(gff, (io.BytesIO, io.StringIO)):
         infile.close()
     return Genes, errors
 
@@ -762,11 +1327,12 @@ def _gff_alignment_parser(gff, fasta, Genes):
                 Genes[ID]["mRNA"][0].append((start, end))
                 Genes[ID]["score"].append(round(float(score), 2))
                 Genes[ID]["target"].append(Target)
-    if not isinstance(gff, io.BytesIO):
+    if not isinstance(gff, (io.BytesIO, io.StringIO)):
         infile.close()
     return Genes, errors
 
 
+# SGD parser temporarily removed due to implementation issues
 def _gff_ncbi_parser(gff, fasta, Genes):
     # this is the default general parser to populate the dictionary
     # idea is to go through line by line and parse the records and add to Genes dictionary
@@ -779,6 +1345,8 @@ def _gff_ncbi_parser(gff, fasta, Genes):
         "no_id": [],
     }
     idParent = {}
+    # Collect introns to generate exon coordinates later
+    introns_by_parent = {}  # {parent_id: [(start, end), ...]}
     SeqRecords = fasta2headers(fasta)
     if isinstance(gff, io.BytesIO):
         gff.seek(0)
@@ -931,7 +1499,17 @@ def _gff_ncbi_parser(gff, fasta, Genes):
                     errors["unparsed_attributes"].append(attr)
         # now we can do add to dictionary these parsed values
         # genbank gff files are incorrect for tRNA so check if gbkey exists and make up gene on the fly
-        if feature in ["gene", "pseudogene"]:
+        if feature in [
+            "gene",
+            "pseudogene",
+            "ncRNA_gene",
+            "rRNA_gene",
+            "snoRNA_gene",
+            "snRNA_gene",
+            "telomerase_RNA_gene",
+            "transposable_element_gene",
+            "tRNA_gene",
+        ]:
             if ID not in Genes:
                 if feature == "pseudogene":
                     pseudoFlag = True
@@ -982,7 +1560,16 @@ def _gff_ncbi_parser(gff, fasta, Genes):
             if not Parent:
                 errors["no_parent"].append(line)
                 continue
-            if feature in ["mRNA", "transcript", "tRNA", "ncRNA", "rRNA"]:
+            if feature in [
+                "mRNA",
+                "transcript",
+                "tRNA",
+                "ncRNA",
+                "rRNA",
+                "snoRNA",
+                "snRNA",
+                "telomerase_RNA",
+            ]:
                 if gbkey and gbkey == "misc_RNA":
                     feature = "ncRNA"
                 if not Product:
@@ -1046,8 +1633,8 @@ def _gff_ncbi_parser(gff, fasta, Genes):
                         )
                 if ID not in idParent:
                     idParent[ID] = Parent
-            # treat exon features
-            elif feature == "exon":
+            # treat exon features (including non-standard exon types)
+            elif feature in ["exon", "noncoding_exon", "pseudogenic_exon"]:
                 if "," in Parent:
                     parents = Parent.split(",")
                 else:
@@ -1223,7 +1810,17 @@ def _gff_ncbi_parser(gff, fasta, Genes):
                             # determine which transcript this is get index from id
                             i = Genes[GeneFeature]["ids"].index(p)
                             Genes[GeneFeature]["3UTR"][i].append((start, end))
-    if not isinstance(gff, io.BytesIO):
+            # handle intron features - collect them for later processing
+            elif feature == "intron":
+                if Parent:
+                    if Parent not in introns_by_parent:
+                        introns_by_parent[Parent] = []
+                    introns_by_parent[Parent].append((start, end))
+
+    # Process introns to generate exon coordinates
+    _process_introns_to_exons(Genes, introns_by_parent, idParent, {})
+
+    if not isinstance(gff, (io.BytesIO, io.StringIO)):
         infile.close()
     return Genes, errors
 
@@ -1307,7 +1904,17 @@ def validate_and_translate_models(
     }
     assert len(v["ids"]) == len(v["type"])
     for i in range(0, len(v["ids"])):
-        if v["type"][i] in ["mRNA", "tRNA", "ncRNA", "rRNA", "transcript"]:
+        if v["type"][i] in [
+            "mRNA",
+            "tRNA",
+            "ncRNA",
+            "rRNA",
+            "transcript",
+            "snoRNA",
+            "snRNA",
+            "tmRNA",
+            "telomerase_RNA",
+        ]:
             if v["strand"] == "+":
                 sortedExons = sorted(v["mRNA"][i], key=lambda tup: tup[0])
             else:
@@ -1411,7 +2018,7 @@ def _detect_format(gff):
     # this is incomplete search, but sniff if this is an NCBI GFF3 record
     parser = _gff_default_parser
     _format = "default"
-    if isinstance(gff, io.BytesIO):
+    if isinstance(gff, (io.BytesIO, io.StringIO)):
         gff.seek(0)
         infile = gff
     else:
@@ -1423,7 +2030,7 @@ def _detect_format(gff):
                 _format = "ncbi"
         else:
             break
-    if not isinstance(gff, io.BytesIO):
+    if not isinstance(gff, (io.BytesIO, io.StringIO)):
         infile.close()
     return parser, _format
 
@@ -1732,8 +2339,8 @@ def _gtf_default_parser(gtf, fasta, Genes, gtf_format="default"):
                         )
                 if ID not in idParent:
                     idParent[ID] = Parent
-            # treat exon features
-            elif feature == "exon":
+            # treat exon features (including non-standard exon types)
+            elif feature in ["exon", "noncoding_exon", "pseudogenic_exon"]:
                 Parent = info.get("transcript_id", None)
                 if Parent and "," in Parent:
                     parents = Parent.split(",")
@@ -2439,6 +3046,16 @@ def gff2dict(
     # some logic here to predict format eventually
     if not annotation:
         annotation = {}
+
+    # Check if this is a combined GFF3+FASTA file
+    # This happens when fasta is None/False and the gff file contains both GFF3 and FASTA data
+    if (fasta is None or fasta is False or gff == fasta) and is_combined_gff_fasta(gff):
+        if debug:
+            logger("Detected combined GFF3+FASTA file, splitting content\n")
+        gff_content, fasta_content = split_combined_gff_fasta(gff)
+        gff = gff_content
+        fasta = fasta_content
+
     # autodetect format
     if gff_format == "auto":
         gff_parser, _format = _detect_format(gff)
@@ -2451,6 +3068,9 @@ def gff2dict(
     elif gff_format == "alignment":
         gff_parser = _gff_alignment_parser
         _format = "alignment"
+    # elif gff_format == "sgd":
+    #     gff_parser = _gff_sgd_parser
+    #     _format = "sgd"
     else:
         gff_parser = _gff_default_parser
         _format = "default"
@@ -2478,7 +3098,7 @@ def gff2dict(
                             len(err_v), err
                         )
                     )
-                    print_errors = random.sample(err_v, 10)
+                    print_errors = random.sample(err_v, min(10, len(err_v)))
                     logger("{}\n".format("\n".join(print_errors)))
     if debug:
         logger(
@@ -2502,7 +3122,7 @@ def simplifyGO(inputList):
     return simple
 
 
-def dict2gff3(infile, output=False, debug=False, source=False, newline=False):
+def dict2gff3(infile, output=False, debug=False, source=False, newline=False, url_encode=False):
     """Convert GFFtk standardized annotation dictionary to GFF3 file.
 
     Annotation dictionary generated by gff2dict or tbl2dict passed as input. This function then write to GFF3 format
@@ -2515,6 +3135,12 @@ def dict2gff3(infile, output=False, debug=False, source=False, newline=False):
         annotation file in GFF3 format
     debug : bool, default=False
         print debug information to stderr
+    source : str, default=False
+        override source field in GFF3 output
+    newline : bool, default=False
+        add newline after each gene
+    url_encode : bool, default=False
+        URL encode attribute values for downstream tool compatibility
 
     """
 
@@ -2526,13 +3152,16 @@ def dict2gff3(infile, output=False, debug=False, source=False, newline=False):
     sortedGenes = OrderedDict(sGenes)
     # then loop through and write GFF3 format
     if output:
-        if output.endswith(".gz"):
+        if hasattr(output, "write"):  # It's a file-like object (StringIO, etc.)
+            gffout = output
+        elif output.endswith(".gz"):
             copen = gzip.open
             mopen = "wt"
+            gffout = copen(output, mopen)
         else:
             copen = open
             mopen = "w"
-        gffout = copen(output, mopen)
+            gffout = copen(output, mopen)
     else:
         gffout = sys.stdout
     gffout.write("##gff-version 3\n")
@@ -2655,19 +3284,52 @@ def dict2gff3(infile, output=False, debug=False, source=False, newline=False):
                     else:
                         CleanedNote.append(x.replace(",", ""))
                 extraAnnotations = extraAnnotations + "Note={:};".format(",".join(CleanedNote))
+            # Calculate mRNA boundaries from exon coordinates for this transcript
+            if v["mRNA"][i] and len(v["mRNA"][i]) > 0:
+                # Use actual exon coordinates to determine mRNA boundaries
+                try:
+                    mrna_start = min(coord[0] for coord in v["mRNA"][i] if len(coord) >= 2)
+                    mrna_end = max(coord[1] for coord in v["mRNA"][i] if len(coord) >= 2)
+                except (ValueError, TypeError):
+                    # Fallback if coordinate calculation fails
+                    mrna_start = v["location"][0]
+                    mrna_end = v["location"][1]
+            else:
+                # Fallback to gene location if no exons
+                mrna_start = v["location"][0]
+                mrna_end = v["location"][1]
+
+            # Apply URL encoding if requested
+            product_value = v["product"][i]
+            extra_annotations = extraAnnotations
+            if url_encode:
+                product_value = quote(str(product_value), safe="")
+                # URL encode values in extraAnnotations while preserving structure
+                if extra_annotations:
+                    # Split by semicolons, encode values after equals signs
+                    encoded_parts = []
+                    for part in extra_annotations.split(";"):
+                        if "=" in part and part.strip():
+                            key, value = part.split("=", 1)
+                            encoded_value = quote(str(value), safe="")
+                            encoded_parts.append(f"{key}={encoded_value}")
+                        elif part.strip():
+                            encoded_parts.append(part)
+                    extra_annotations = ";".join(encoded_parts)
+
             # now write mRNA feature
             gffout.write(
                 "{:}\t{:}\t{:}\t{:}\t{:}\t.\t{:}\t.\tID={:};Parent={:};product={:};{:}\n".format(
                     v["contig"],
                     new_source,
                     v["type"][i],
-                    v["location"][0],
-                    v["location"][1],
+                    mrna_start,
+                    mrna_end,
                     v["strand"],
                     v["ids"][i],
                     k,
-                    v["product"][i],
-                    extraAnnotations,
+                    product_value,
+                    extra_annotations,
                 )
             )
             if v["type"][i] in ["mRNA", "tRNA", "ncRNA", "tmRNA", "snRNA", "snoRNA"]:
@@ -2751,7 +3413,9 @@ def dict2gff3(infile, output=False, debug=False, source=False, newline=False):
                         current_phase = 0
         if newline:
             gffout.write("\n")
-    if output:
+    if output and not hasattr(
+        output, "write"
+    ):  # Only close if it's a filename, not a file-like object
         gffout.close()
 
 
@@ -2959,6 +3623,73 @@ def dict2gtf(infile, output=False, source=False):
                 gtfout.write("\n")
     if output:
         gtfout.close()
+
+
+def dict2combined_gff_fasta(annotation_dict, fasta_dict, output=False, debug=False, source=False):
+    """Write GFFtk annotation dictionary and FASTA sequences to combined GFF3+FASTA format.
+
+    Parameters
+    ----------
+    annotation_dict : dict
+        GFFtk standardized annotation dictionary
+    fasta_dict : dict
+        Dictionary of sequences keyed by contig name
+    output : str or file handle, default=False
+        Output file path or handle. If False, writes to stdout
+    debug : bool, default=False
+        Print debug information
+    source : str, default=False
+        Override source field in GFF3 output
+
+    Returns
+    -------
+    None
+    """
+    # First write the GFF3 part
+    if output:
+        if isinstance(output, str):
+            outfile = open(output, "w")
+        else:
+            outfile = output
+    else:
+        outfile = sys.stdout
+
+    # Write GFF3 header
+    outfile.write("##gff-version 3\n")
+
+    # Write sequence regions if we have fasta data
+    if fasta_dict:
+        for contig, seq in fasta_dict.items():
+            outfile.write(f"##sequence-region {contig} 1 {len(seq)}\n")
+
+    # Write the annotation data using existing dict2gff3 function
+    # We'll capture the GFF3 output and write it
+    import io
+
+    gff_buffer = io.StringIO()
+    dict2gff3(annotation_dict, output=gff_buffer, debug=debug, source=source)
+    gff_content = gff_buffer.getvalue()
+    gff_buffer.close()
+
+    # Skip the ##gff-version 3 line since we already wrote it
+    gff_lines = gff_content.split("\n")
+    for line in gff_lines:
+        if line.startswith("##gff-version"):
+            continue
+        if line.strip():  # Skip empty lines
+            outfile.write(line + "\n")
+
+    # Write the FASTA section
+    if fasta_dict:
+        outfile.write("##FASTA\n")
+        for contig, seq in fasta_dict.items():
+            outfile.write(f">{contig}\n")
+            # Write sequence in 80-character lines
+            for i in range(0, len(seq), 80):
+                outfile.write(seq[i : i + 80] + "\n")
+
+    if output and isinstance(output, str):
+        outfile.close()
 
 
 def dict2gff3alignments(

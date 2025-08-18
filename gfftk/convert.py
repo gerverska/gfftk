@@ -7,12 +7,16 @@ from natsort import natsorted
 
 from .fasta import RevComp, fasta2lengths, softwrap
 from .genbank import dict2tbl, table2asn, tbl2dict
-from .gff import dict2gff3, dict2gtf, gff2dict, gtf2dict
-from .utils import check_inputs, which2, zopen
+from .gff import dict2combined_gff_fasta, dict2gff3, dict2gtf, gff2dict, gtf2dict
+from .utils import check_inputs, test_table2asn_functional, which2, zopen
 
 
 def convert(args):
-    check_inputs([args.input] + [args.fasta])
+    # Check inputs, but allow fasta to be None for combined files
+    inputs_to_check = [args.input]
+    if args.fasta:
+        inputs_to_check.append(args.fasta)
+    check_inputs(inputs_to_check)
     if not args.input_format:  # we have to guess
         if args.input.endswith((".tbl", ".tbl.gz")):
             args.input_format = "tbl"
@@ -28,13 +32,23 @@ def convert(args):
             args.output_format = "tbl"
         elif args.out and args.out.endswith((".gff", ".gff3", ".gff.gz", ".gff3.gz")):
             args.output_format = "gff3"
+        elif args.out and args.out.endswith((".combined.gff", ".combined.gff3")):
+            args.output_format = "combined"
         elif args.out and args.out.endswith((".gtf")):
             args.output_format = "gtf"
         elif args.out and args.out.endswith((".gbk", ".gb", ".gbf", ".gbff", ".gbk")):
             args.output_format = "gbff"
             if not which2("table2asn"):
                 sys.stderr.write(
-                    "ERROR: table2asn is not in PATH and is required to generate genbank output"
+                    "ERROR: table2asn is not in PATH and is required to generate genbank output\n"
+                )
+                raise SystemExit(1)
+            # Test if table2asn is functional
+            if not test_table2asn_functional():
+                sys.stderr.write(
+                    "ERROR: table2asn binary found but is not functional. "
+                    "This may be due to OS compatibility issues or a corrupted installation.\n"
+                    "Please reinstall table2asn or check system requirements.\n"
                 )
                 raise SystemExit(1)
         elif args.out:
@@ -109,6 +123,7 @@ def convert(args):
                 debug=args.debug,
                 grep=args.grep,
                 grepv=args.grepv,
+                url_encode=getattr(args, "url_encode", False),
             )
         elif args.output_format == "tbl":
             gff2tbl(
@@ -133,6 +148,16 @@ def convert(args):
             )
         elif args.output_format == "gtf":
             gff2gtf(
+                args.input,
+                args.fasta,
+                output=args.out,
+                table=args.table,
+                debug=args.debug,
+                grep=args.grep,
+                grepv=args.grepv,
+            )
+        elif args.output_format == "combined":
+            gff2combined(
                 args.input,
                 args.fasta,
                 output=args.out,
@@ -577,7 +602,7 @@ def tbl2cdstranscripts(tbl, fasta, output=False, table=1, grep=[], grepv=[]):
     _dict2cdstranscripts(Genes, output=output)
 
 
-def gff2gff3(gff, fasta, output=False, table=1, debug=False, grep=[], grepv=[]):
+def gff2gff3(gff, fasta, output=False, table=1, debug=False, grep=[], grepv=[], url_encode=False):
     """Convert GFF3 format to GFF3 format with filtering.
 
     Will parse GFF3 format into GFFtk annotation dictionary, apply filtering, and then write to GFF3 output.
@@ -608,7 +633,7 @@ def gff2gff3(gff, fasta, output=False, table=1, debug=False, grep=[], grepv=[]):
     # apply filtering
     Genes = filter_annotations(Genes, grep=grep, grepv=grepv)
     # write to GFF3 format
-    dict2gff3(Genes, output=output)
+    dict2gff3(Genes, output=output, url_encode=url_encode)
 
 
 def gff2gtf(gff, fasta, output=False, table=1, debug=False, grep=[], grepv=[]):
@@ -1001,3 +1026,47 @@ def gtf2cdstranscripts(gff, fasta, output=False, table=1, debug=False, grep=[], 
     Genes = gtf2dict(gff, fasta, table=table, debug=debug)
     # write to protein fasta
     _dict2cdstranscripts(Genes, output=output)
+
+
+def gff2combined(gff, fasta, output=False, table=1, debug=False, grep=[], grepv=[]):
+    """Convert GFF3 and FASTA to combined GFF3+FASTA format.
+
+    Will parse GFF3 format into GFFtk annotation dictionary and then write
+    to combined GFF3+FASTA format with both annotations and sequences.
+
+    Parameters
+    ----------
+    gff : filename
+        genome annotation text file in GFF3 format
+    fasta : filename
+        genome sequence in FASTA format
+    table : int, default=1
+        codon table [1]
+    debug : bool, default=False
+        print debug information to stderr
+    output : str, default=sys.stdout
+        combined GFF3+FASTA format file
+    grep : list, default=[]
+        filter results to only include gene models with locus_tag matching grep
+    grepv : list, default=[]
+        filter results to exclude gene models with locus_tag matching grepv
+
+    """
+    from .fasta import fasta2dict
+    from .utils import filter_annotations
+
+    # Handle combined input file case
+    if fasta is None or fasta is False:
+        fasta = gff
+
+    # load gff into dictionary
+    Genes = gff2dict(gff, fasta, table=table, debug=debug)
+
+    # load fasta sequences
+    SeqRecords = fasta2dict(fasta)
+
+    # apply filters if specified
+    Genes = filter_annotations(Genes, grep=grep, grepv=grepv)
+
+    # write to combined format
+    dict2combined_gff_fasta(Genes, SeqRecords, output=output, debug=debug)

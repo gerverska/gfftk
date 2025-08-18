@@ -402,6 +402,63 @@ gfftk provides functions for working with FASTA files:
     # Write a FASTA file
     gfftk.fasta.dict2fasta(fasta_dict, "output.fasta")
 
+Working with Combined GFF3+FASTA Files
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+gfftk supports combined GFF3+FASTA files, which contain both annotation data and sequence data in a single file. This format is commonly used by some working groups and databases.
+
+**Reading Combined Files**
+
+You can read combined GFF3+FASTA files by passing ``None`` for the FASTA parameter:
+
+.. code-block:: python
+
+    import gfftk
+
+    # Parse a combined GFF3+FASTA file
+    gff_dict = gfftk.gff.gff2dict("combined.gff", None)
+
+    # The function automatically detects the ##FASTA directive and splits the content
+    print(f"Number of genes: {len(gff_dict)}")
+
+**Writing Combined Files**
+
+You can create combined GFF3+FASTA files using the ``dict2combined_gff_fasta`` function:
+
+.. code-block:: python
+
+    import gfftk
+
+    # Parse separate GFF3 and FASTA files
+    gff_dict = gfftk.gff.gff2dict("input.gff3", "genome.fasta")
+    fasta_dict = gfftk.fasta.fasta2dict("genome.fasta")
+
+    # Write to combined format
+    gfftk.gff.dict2combined_gff_fasta(gff_dict, fasta_dict, output="combined.gff")
+
+**Using the Command Line**
+
+You can also use the command-line interface to work with combined files:
+
+.. code-block:: bash
+
+    # Create a combined file from separate GFF3 and FASTA files
+    gfftk convert -i input.gff3 -f genome.fasta --output-format combined -o combined.gff
+
+    # Convert a combined file back to separate GFF3 format
+    gfftk convert -i combined.gff --output-format gff3 -o output.gff3
+
+**Non-Standard GFF3 Features**
+
+gfftk now supports several non-standard GFF3 features commonly used by some annotation pipelines:
+
+* ``intron`` - Intron features
+* ``noncoding_exon`` - Non-coding exon features
+* ``five_prime_UTR_intron`` - 5' UTR intron features
+* ``pseudogenic_exon`` - Pseudogenic exon features
+
+These features are automatically recognized and parsed when present in GFF3 files.
+
 GFF3 File Manipulation
 ~~~~~~~~~~~~~~~~~~~
 
