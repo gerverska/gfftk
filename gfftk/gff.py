@@ -1934,13 +1934,21 @@ def validate_and_translate_models(
                 results["partialStart"].append(None)
                 results["partialStop"].append(None)
             else:
+                # Sort CDS and phase together to maintain correspondence
                 results["type"].append("mRNA")
+                cds_phase_pairs = list(zip(v["CDS"][i], v["phase"][i]))
                 if v["strand"] == "+":
-                    sortedCDS = sorted(v["CDS"][i], key=lambda tup: tup[0])
+                    sorted_pairs = sorted(cds_phase_pairs, key=lambda pair: pair[0][0])
                 else:
-                    sortedCDS = sorted(v["CDS"][i], key=lambda tup: tup[0], reverse=True)
-                # get the codon_start by getting first CDS phase + 1
-                indexStart = [x for x, y in enumerate(v["CDS"][i]) if y[0] == sortedCDS[0][0]]
+                    sorted_pairs = sorted(
+                        cds_phase_pairs, key=lambda pair: pair[0][0], reverse=True
+                    )
+
+                # Unzip the sorted pairs
+                sortedCDS = [pair[0] for pair in sorted_pairs]
+                sortedPhase = [pair[1] for pair in sorted_pairs]
+
+                # get the codon_start from the first CDS phase + 1
                 cdsSeq = getSeqRegions(SeqRecords, v["contig"], sortedCDS)
                 if gap_filter:
                     cdsSeq, v["CDS"][i] = start_end_gap(cdsSeq, v["CDS"][i])
@@ -1961,7 +1969,7 @@ def validate_and_translate_models(
                     v["phase"][i] = codon_start - 1
                 else:
                     try:
-                        codon_start = int(v["phase"][i][indexStart[0]]) + 1
+                        codon_start = int(sortedPhase[0]) + 1
                     except IndexError:
                         # Default to 1 if index is out of range
                         codon_start = 1
