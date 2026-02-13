@@ -1934,6 +1934,7 @@ def validate_and_translate_models(
                 results["codon_start"].append(None)
                 results["partialStart"].append(None)
                 results["partialStop"].append(None)
+                results["phase"].append([])
             else:
                 # Sort CDS and phase together to maintain correspondence
                 results["type"].append("mRNA")
