@@ -1901,6 +1901,7 @@ def validate_and_translate_models(
         "partialStart": [],
         "partialStop": [],
         "type": [],
+        "phase": [],
     }
     assert len(v["ids"]) == len(v["type"])
     for i in range(0, len(v["ids"])):
@@ -1986,6 +1987,7 @@ def validate_and_translate_models(
                         log(f"ERROR nonsensical strand ({v['strand']}) for gene {v['ids'][i]}")
                 results["cds_transcript"].append(cdsSeq)
                 results["CDS"].append(sortedCDS)
+                results["phase"].append(sortedPhase)
                 results["protein"].append(protSeq)
                 if protSeq:
                     if protSeq.endswith("*"):
@@ -2000,6 +2002,7 @@ def validate_and_translate_models(
                         results["pseudo"] = True
         else:
             results["CDS"].append([])
+            results["phase"].append([])
             results["type"].append(v["type"][i])
             results["codon_start"].append(None)
             results["partialStart"].append(None)
